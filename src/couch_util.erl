@@ -32,6 +32,7 @@
 -export([rfc1123_date/0, rfc1123_date/1]).
 -export([integer_to_boolean/1, boolean_to_integer/1]).
 -export([find_in_binary/2]).
+-export([parse_changes_query/2]).
 
 -include_lib("couch/include/couch_db.hrl").
 
@@ -512,7 +513,6 @@ boolean_to_integer(true) ->
 boolean_to_integer(false) ->
     0.
 
-
 find_in_binary(_B, <<>>) ->
     not_found;
 
@@ -542,3 +542,40 @@ match_rest_of_prefix([{Pos, _Len} | Rest], Prefix, Data, PrefixLength, N) ->
         {_Pos, _Len1} ->
             {partial, N + Pos}
     end.
+
+parse_changes_query(Req, Db) ->
+    lists:foldl(fun({Key, Value}, Args) ->
+        case {string:to_lower(Key), Value} of
+        {"feed", _} ->
+            Args#changes_args{feed=Value};
+        {"descending", "true"} ->
+            Args#changes_args{dir=rev};
+        {"since", "now"} ->
+            UpdateSeq = with_db(Db#db.name, fun(WDb) ->
+                couch_db:get_update_seq(WDb)
+            end),
+            Args#changes_args{since=UpdateSeq};
+        {"since", _} ->
+            Args#changes_args{since=list_to_integer(Value)};
+        {"last-event-id", _} ->
+            Args#changes_args{since=list_to_integer(Value)};
+        {"limit", _} ->
+            Args#changes_args{limit=list_to_integer(Value)};
+        {"style", _} ->
+            Args#changes_args{style=list_to_existing_atom(Value)};
+        {"heartbeat", "true"} ->
+            Args#changes_args{heartbeat=true};
+        {"heartbeat", _} ->
+            Args#changes_args{heartbeat=list_to_integer(Value)};
+        {"timeout", _} ->
+            Args#changes_args{timeout=list_to_integer(Value)};
+        {"include_docs", "true"} ->
+            Args#changes_args{include_docs=true};
+        {"conflicts", "true"} ->
+            Args#changes_args{conflicts=true};
+        {"filter", _} ->
+            Args#changes_args{filter=Value};
+        _Else -> % unknown key value pair, ignore.
+            Args
+        end
+    end, #changes_args{}, couch_httpd:qs(Req)).
