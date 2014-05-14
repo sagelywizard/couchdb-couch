@@ -85,6 +85,7 @@ map_doc_raw(Proc, Doc) ->
 
 
 map_docs_raw(Proc, DocList) ->
+    couch_log:error("DocList: ~p", [DocList]),
     {Mod, Fun} = Proc#proc.prompt_many_fun,
     CommandList = lists:map(
         fun(Doc) ->
