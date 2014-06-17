@@ -26,7 +26,7 @@
 -export([start_chunked_response/3,send_chunk/2,log_request/2]).
 -export([start_response_length/4, start_response/3, send/2]).
 -export([start_json_response/2, start_json_response/3, end_json_response/1]).
--export([send_response/4,send_method_not_allowed/2,send_error/4, send_redirect/2,send_chunked_error/2]).
+-export([send_response/4,send_method_not_allowed/2,send_error/2,send_error/4, send_redirect/2,send_chunked_error/2]).
 -export([send_json/2,send_json/3,send_json/4,last_chunk/1,parse_multipart_request/3]).
 -export([accepted_encodings/1,handle_request_int/5,validate_referer/1,validate_ctype/2]).
 -export([http_1_0_keep_alive/2]).
@@ -38,57 +38,53 @@ start_link(http) ->
     start_link(?MODULE, [{port, Port}]);
 start_link(https) ->
     Port = config:get("ssl", "port", "6984"),
-    CertFile = config:get("ssl", "cert_file", nil),
-    KeyFile = config:get("ssl", "key_file", nil),
-    Options = case CertFile /= nil andalso KeyFile /= nil of
+    {ok, Ciphers} = couch_util:parse_term(config:get("ssl", "ciphers", "nil")),
+    {ok, Versions} = couch_util:parse_term(config:get("ssl", "tls_versions", "nil")),
+    {ok, SecureRenegotiate} = couch_util:parse_term(config:get("ssl", "secure_renegotiate", "nil")),
+    ServerOpts0 =
+        [{cacertfile, config:get("ssl", "cacert_file", nil)},
+         {keyfile, config:get("ssl", "key_file", nil)},
+         {certfile, config:get("ssl", "cert_file", nil)},
+         {password, config:get("ssl", "password", nil)},
+         {secure_renegotiate, SecureRenegotiate},
+         {versions, Versions},
+         {ciphers, Ciphers}],
+
+    case (couch_util:get_value(keyfile, ServerOpts0) == nil orelse
+        couch_util:get_value(certfile, ServerOpts0) == nil) of
         true ->
-            SslOpts = [{certfile, CertFile}, {keyfile, KeyFile}],
-
-            %% set password if one is needed for the cert
-            SslOpts1 = case config:get("ssl", "password", nil) of
-                nil -> SslOpts;
-                Password ->
-                    SslOpts ++ [{password, Password}]
-            end,
-            % do we verify certificates ?
-            FinalSslOpts = case config:get("ssl",
-                    "verify_ssl_certificates", "false") of
-                "false" -> SslOpts1;
-                "true" ->
-                    case config:get("ssl",
-                            "cacert_file", nil) of
-                        nil ->
-                            io:format("Verify SSL certificate "
-                                ++"enabled but file containing "
-                                ++"PEM encoded CA certificates is "
-                                ++"missing", []),
-                            throw({error, missing_cacerts});
-                        CaCertFile ->
-                            Depth = list_to_integer(config:get("ssl",
-                                    "ssl_certificate_max_depth",
-                                    "1")),
-                            FinalOpts = [
-                                {cacertfile, CaCertFile},
-                                {depth, Depth},
-                                {verify, verify_peer}],
-                            % allows custom verify fun.
-                            case config:get("ssl",
-                                    "verify_fun", nil) of
-                                nil -> FinalOpts;
-                                SpecStr ->
-                                    FinalOpts
-                                    ++ [{verify_fun, make_arity_3_fun(SpecStr)}]
-                            end
-                    end
-            end,
-
-            [{port, Port},
-                {ssl, true},
-                {ssl_opts, FinalSslOpts}];
-        false ->
             io:format("SSL enabled but PEM certificates are missing.", []),
-            throw({error, missing_certs})
+            throw({error, missing_certs});
+        false ->
+            ok
     end,
+
+    ServerOpts = [Opt || {_, V}=Opt <- ServerOpts0, V /= nil],
+
+    ClientOpts = case config:get("ssl", "verify_ssl_certificates", "false") of
+        "false" ->
+            [];
+        "true" ->
+            FailIfNoPeerCert = case config:get("ssl", "fail_if_no_peer_cert", "false") of
+            "false" -> false;
+            "true" -> true
+            end,
+            [{depth, list_to_integer(config:get("ssl",
+                "ssl_certificate_max_depth", "1"))},
+             {fail_if_no_peer_cert, FailIfNoPeerCert},
+             {verify, verify_peer}] ++
+            case config:get("ssl", "verify_fun", nil) of
+                nil -> [];
+                SpecStr ->
+                    [{verify_fun, make_arity_3_fun(SpecStr)}]
+            end
+    end,
+    SslOpts = ServerOpts ++ ClientOpts,
+
+    Options =
+        [{port, Port},
+         {ssl, true},
+         {ssl_opts, SslOpts}],
     start_link(https, Options).
 start_link(Name, Options) ->
     BindAddress = config:get("httpd", "bind_address", any),
@@ -157,7 +153,7 @@ start_link(Name, Options) ->
 
 stop() ->
     mochiweb_http:stop(couch_httpd),
-    mochiweb_http:stop(https).
+    catch mochiweb_http:stop(https).
 
 
 set_auth_handlers() ->
@@ -199,6 +195,8 @@ make_fun_spec_strs(SpecStr) ->
 
 handle_request(MochiReq, DefaultFun, UrlHandlers, DbUrlHandlers,
     DesignUrlHandlers) ->
+    %% reset rewrite count for new request
+    erlang:put(?REWRITE_COUNT, 0),
 
     MochiReq1 = couch_httpd_vhost:dispatch_host(MochiReq),
 
@@ -207,13 +205,11 @@ handle_request(MochiReq, DefaultFun, UrlHandlers, DbUrlHandlers,
 
 handle_request_int(MochiReq, DefaultFun,
             UrlHandlers, DbUrlHandlers, DesignUrlHandlers) ->
-    Begin = now(),
+    Begin = os:timestamp(),
     % for the path, use the raw path with the query string and fragment
     % removed, but URL quoting left intact
     RawUri = MochiReq:get(raw_path),
     {"/" ++ Path, _, _} = mochiweb_util:urlsplit_path(RawUri),
-
-    Headers = MochiReq:get(headers),
 
     % get requested path
     RequestedPath = case MochiReq:get_header_value("x-couchdb-vhost-path") of
@@ -287,7 +283,8 @@ handle_request_int(MochiReq, DefaultFun,
         design_url_handlers = DesignUrlHandlers,
         default_fun = DefaultFun,
         url_handlers = UrlHandlers,
-        user_ctx = erlang:erase(pre_rewrite_user_ctx)
+        user_ctx = erlang:erase(pre_rewrite_user_ctx),
+        auth = erlang:erase(pre_rewrite_auth)
     },
 
     HandlerFun = couch_util:dict_find(HandlerKey, UrlHandlers, DefaultFun),
@@ -295,6 +292,7 @@ handle_request_int(MochiReq, DefaultFun,
 
     {ok, Resp} =
     try
+        check_request_uri_length(RawUri),
         case couch_httpd_cors:is_preflight_request(HttpReq) of
         #httpd{} ->
             case authenticate_request(HttpReq, AuthHandlers) of
@@ -328,6 +326,8 @@ handle_request_int(MochiReq, DefaultFun,
             send_error(HttpReq, {bad_otp_release, ErrorReason});
         exit:{body_too_large, _} ->
             send_error(HttpReq, request_entity_too_large);
+        exit:{uri_too_long, _} ->
+            send_error(HttpReq, request_uri_too_long);
         throw:Error ->
             Stack = erlang:get_stacktrace(),
             ?LOG_DEBUG("Minor error in HTTP request: ~p",[Error]),
@@ -349,10 +349,23 @@ handle_request_int(MochiReq, DefaultFun,
             ?LOG_INFO("Stacktrace: ~p",[Stack]),
             send_error(HttpReq, Error)
     end,
-    RequestTime = round(timer:now_diff(now(), Begin)/1000),
+    RequestTime = round(timer:now_diff(os:timestamp(), Begin)/1000),
     couch_stats_collector:record({couchdb, request_time}, RequestTime),
     couch_stats_collector:increment({httpd, requests}),
     {ok, Resp}.
+
+check_request_uri_length(Uri) ->
+    check_request_uri_length(Uri, config:get("httpd", "max_uri_length")).
+
+check_request_uri_length(_Uri, undefined) ->
+    ok;
+check_request_uri_length(Uri, MaxUriLen) when is_list(MaxUriLen) ->
+    case length(Uri) > list_to_integer(MaxUriLen) of
+        true ->
+            throw(request_uri_too_long);
+        false ->
+            ok
+    end.
 
 % Try authentication handlers in order until one sets a user_ctx
 % the auth funs also have the option of returning a response
@@ -529,7 +542,7 @@ body(#httpd{req_body=ReqBody}) ->
     ReqBody.
 
 json_body(Httpd) ->
-    ?JSON_DECODE(body(Httpd)).
+    ?JSON_DECODE(maybe_decompress(Httpd, body(Httpd))).
 
 json_body_obj(Httpd) ->
     case json_body(Httpd) of
@@ -539,6 +552,15 @@ json_body_obj(Httpd) ->
     end.
 
 
+maybe_decompress(Httpd, Body) ->
+    case header_value(Httpd, "Content-Encoding", "identity") of
+    "gzip" ->
+        zlib:gunzip(Body);
+    "identity" ->
+        Body;
+    Else ->
+        throw({bad_ctype, [Else, " is not a supported content encoding."]})
+    end.
 
 doc_etag(#doc{revs={Start, [DiskRev|_]}}) ->
     "\"" ++ ?b2l(couch_doc:rev_to_str({Start, DiskRev})) ++ "\"".
@@ -581,18 +603,14 @@ verify_is_server_admin(#user_ctx{roles=Roles}) ->
     false -> throw({unauthorized, <<"You are not a server admin.">>})
     end.
 
-log_request(#httpd{mochi_req=MochiReq,peer=Peer}, Code) ->
-    case erlang:get(dont_log_request) of
-        true ->
-            ok;
-        _ ->
-            couch_log:notice("~s - - ~s ~s ~B", [
-                Peer,
-                MochiReq:get(method),
-                MochiReq:get(raw_path),
-                Code
-            ])
-    end.
+log_request(#httpd{mochi_req=MochiReq,peer=Peer}=Req, Code) ->
+    couch_log:notice("~s - - ~s ~s ~B", [
+        Peer,
+        MochiReq:get(method),
+        MochiReq:get(raw_path),
+        Code
+    ]),
+    gen_event:notify(couch_plugin, {log_request, Req, Code}).
 
 start_response_length(#httpd{mochi_req=MochiReq}=Req, Code, Headers, Length) ->
     log_request(Req, Code),
@@ -805,6 +823,8 @@ error_info(file_exists) ->
         "created, the file already exists.">>};
 error_info(request_entity_too_large) ->
     {413, <<"too_large">>, <<"the request entity is too large">>};
+error_info(request_uri_too_long) ->
+    {414, <<"too_long">>, <<"the request uri is too long">>};
 error_info({bad_ctype, Reason}) ->
     {415, <<"bad_content_type">>, Reason};
 error_info(requested_range_not_satisfiable) ->
@@ -976,7 +996,7 @@ split_header(Line) ->
      mochiweb_util:parse_header(Value)}].
 
 read_until(#mp{data_fun=DataFun, buffer=Buffer}=Mp, Pattern, Callback) ->
-    case find_in_binary(Pattern, Buffer) of
+    case couch_util:find_in_binary(Pattern, Buffer) of
     not_found ->
         Callback2 = Callback(Buffer),
         {Buffer2, DataFun2} = DataFun(),
@@ -1051,34 +1071,6 @@ check_for_last(#mp{buffer=Buffer, data_fun=DataFun}=Mp) ->
         check_for_last(Mp#mp{buffer= <<Buffer/binary, Data/binary>>,
                 data_fun = DataFun2})
     end.
-
-find_in_binary(_B, <<>>) ->
-    not_found;
-
-find_in_binary(B, Data) ->
-    case binary:match(Data, [B], []) of
-    nomatch ->
-        partial_find(binary:part(B, {0, byte_size(B) - 1}),
-                     binary:part(Data, {byte_size(Data), -byte_size(Data) + 1}), 1);
-    {Pos, _Len} ->
-        {exact, Pos}
-    end.
-
-partial_find(<<>>, _Data, _Pos) ->
-    not_found;
-
-partial_find(B, Data, N) when byte_size(Data) > 0 ->
-    case binary:match(Data, [B], []) of
-    nomatch ->
-        partial_find(binary:part(B, {0, byte_size(B) - 1}),
-                     binary:part(Data, {byte_size(Data), -byte_size(Data) + 1}), N + 1);
-    {Pos, _Len} ->
-        {partial, N + Pos}
-    end;
-
-partial_find(_B, _Data, _N) ->
-    not_found.
-
 
 validate_bind_address(Address) ->
     case inet_parse:address(Address) of

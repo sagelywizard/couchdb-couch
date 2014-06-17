@@ -14,7 +14,7 @@
 -behaviour(gen_server).
 -behaviour(config_listener).
 
--export([open/2,create/2,delete/2,get_version/0,get_uuid/0]).
+-export([open/2,create/2,delete/2,get_version/0,get_version/1,get_uuid/0]).
 -export([all_databases/0, all_databases/2]).
 -export([init/1, handle_call/3,sup_start_link/0]).
 -export([handle_cast/2,code_change/3,handle_info/2,terminate/2]).
@@ -48,6 +48,11 @@ get_version() ->
     false ->
         "0.0.0"
     end.
+get_version(short) ->
+  %% strip git hash from version string
+  [Version|_Rest] = string:tokens(get_version(), "+"),
+  Version.
+
 
 get_uuid() ->
     case config:get("couchdb", "uuid", nil) of
@@ -110,34 +115,31 @@ delete(DbName, Options) ->
 maybe_add_sys_db_callbacks(DbName, Options) when is_binary(DbName) ->
     maybe_add_sys_db_callbacks(?b2l(DbName), Options);
 maybe_add_sys_db_callbacks(DbName, Options) ->
-    ReplicatorDbName = config:get("replicator", "db", "_replicator"),
-    ReplicatorDbOptions = [
-        {before_doc_update, fun couch_replicator_manager:before_doc_update/2},
-        {after_doc_read, fun couch_replicator_manager:after_doc_read/2},
-        sys_db
-    ] ++ Options,
-    UsersDbName = config:get("couch_httpd_auth", "authentication_db", "_users"),
-    UsersDbOptions = [
-        {before_doc_update, fun couch_users_db:before_doc_update/2},
-        {after_doc_read, fun couch_users_db:after_doc_read/2},
-        sys_db
-    ] ++ Options,
     DbsDbName = config:get("mem3", "shard_db", "dbs"),
-    DbsDbOptions = [sys_db | Options],
-    NodesDbName = config:get("mem3", "node_db", "nodes"),
-    NodesDbOptions = [sys_db | Options],
-    KnownSysDbs = [
-        {ReplicatorDbName, ReplicatorDbOptions},
-        {UsersDbName, UsersDbOptions},
-        {DbsDbName, DbsDbOptions},
-        {NodesDbName, NodesDbOptions}
-    ],
-    case lists:keyfind(DbName, 1, KnownSysDbs) of
-        {DbName, SysOptions} ->
-            SysOptions;
-        false ->
-            Options
+    NodesDbName = config:get("mem3", "shard_db", "nodes"),
+    IsReplicatorDb = DbName == config:get("replicator", "db", "_replicator") orelse
+	path_ends_with(DbName, <<"_replicator">>),
+    IsUsersDb = DbName ==config:get("couch_httpd_auth", "authentication_db", "_users") orelse
+	path_ends_with(DbName, <<"_users">>),
+    if
+	DbName == DbsDbName ->
+	    [sys_db | Options];
+	DbName == NodesDbName ->
+	    [sys_db | Options];
+	IsReplicatorDb ->
+	    [{before_doc_update, fun couch_replicator_manager:before_doc_update/2},
+	     {after_doc_read, fun couch_replicator_manager:after_doc_read/2},
+	     sys_db | Options];
+	IsUsersDb ->
+	    [{before_doc_update, fun couch_users_db:before_doc_update/2},
+	     {after_doc_read, fun couch_users_db:after_doc_read/2},
+	     sys_db | Options];
+	true ->
+	    Options
     end.
+
+path_ends_with(Path, Suffix) ->
+    Suffix == lists:last(binary:split(mem3:dbname(Path), <<"/">>, [global])).
 
 check_dbname(#server{dbname_regexp=RegExp}, DbName) ->
     case re:run(DbName, RegExp, [{capture, none}]) of
@@ -280,7 +282,7 @@ maybe_close_lru_db(#server{lru=Lru}=Server) ->
 
 open_async(Server, From, DbName, Filepath, Options) ->
     Parent = self(),
-    put({async_open, DbName}, now()),
+    put({async_open, DbName}, os:timestamp()),
     Opener = spawn_link(fun() ->
         Res = couch_db:start_link(DbName, Filepath, Options),
         case {Res, lists:member(create, Options)} of
@@ -323,7 +325,7 @@ handle_call(get_server, _From, Server) ->
 handle_call({open_result, DbName, {ok, Db}}, _From, Server) ->
     link(Db#db.main_pid),
     case erase({async_open, DbName}) of undefined -> ok; T0 ->
-        ?LOG_INFO("needed ~p ms to open new ~s", [timer:now_diff(now(),T0)/1000,
+        ?LOG_INFO("needed ~p ms to open new ~s", [timer:now_diff(os:timestamp(),T0)/1000,
             DbName])
     end,
     % icky hack of field values - compactor_pid used to store clients

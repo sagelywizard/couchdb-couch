@@ -130,7 +130,7 @@ handle_info({Port, {exit_status, Status}}, Table) ->
         [D] ->
             % Port died for unknown reason. Check to see if it's
             % died too many times or if we should boot it back up.
-            case should_halt([now() | D#daemon.errors]) of
+            case should_halt([os:timestamp() | D#daemon.errors]) of
                 {true, _} ->
                     % Halting the process. We won't try and reboot
                     % until the configuration changes.
@@ -206,9 +206,19 @@ handle_config_change(Section, Key, _, _, _) ->
 %
 
 start_port(Command) ->
+    start_port(Command, []).
+
+start_port(Command, EnvPairs) ->
     PrivDir = couch_util:priv_dir(),
     Spawnkiller = filename:join(PrivDir, "couchspawnkillable"),
-    Port = open_port({spawn, Spawnkiller ++ " " ++ Command}, ?PORT_OPTIONS),
+    Opts = case lists:keytake(env, 1, ?PORT_OPTIONS) of
+        false ->
+            ?PORT_OPTIONS ++ [ {env,EnvPairs} ];
+        {value, {env,OldPairs}, SubOpts} ->
+            AllPairs = lists:keymerge(1, EnvPairs, OldPairs),
+            SubOpts ++ [ {env,AllPairs} ]
+    end,
+    Port = open_port({spawn, Spawnkiller ++ " " ++ Command}, Opts),
     {ok, Port}.
 
 
@@ -366,7 +376,7 @@ should_halt(Errors) ->
     RetryTimeCfg = config:get("os_daemon_settings", "retry_time", "5"),
     RetryTime = list_to_integer(RetryTimeCfg),
 
-    Now = now(),
+    Now = os:timestamp(),
     RecentErrors = lists:filter(fun(Time) ->
         timer:now_diff(Now, Time) =< RetryTime * 1000000
     end, Errors),

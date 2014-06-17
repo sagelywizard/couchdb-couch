@@ -16,7 +16,7 @@
 -export([handle_request/1, handle_compact_req/2, handle_design_req/2,
     db_req/2, couch_doc_open/4,handle_changes_req/2,
     update_doc_result_to_json/1, update_doc_result_to_json/2,
-    handle_design_info_req/3]).
+    handle_design_info_req/3, handle_changes/4]).
 
 -import(couch_httpd,
     [send_json/2,send_json/3,send_json/4,send_method_not_allowed/2,
@@ -56,13 +56,18 @@ handle_request(#httpd{path_parts=[DbName|RestParts],method=Method,
 
 handle_changes_req(#httpd{method='POST'}=Req, Db) ->
     couch_httpd:validate_ctype(Req, "application/json"),
-    handle_changes_req1(Req, Db);
+    handle_db_changes_req(Req, Db);
 handle_changes_req(#httpd{method='GET'}=Req, Db) ->
-    handle_changes_req1(Req, Db);
+    handle_db_changes_req(Req, Db);
 handle_changes_req(#httpd{path_parts=[_,<<"_changes">>]}=Req, _Db) ->
     send_method_not_allowed(Req, "GET,HEAD,POST").
 
-handle_changes_req1(Req, #db{name=DbName}=Db) ->
+handle_db_changes_req(Req, Db) ->
+    ChangesArgs = couch_util:parse_changes_query(Req, Db),
+    ChangesFun = couch_changes:handle_changes(ChangesArgs, Req, Db),
+    handle_changes(Req, Db, ChangesArgs, ChangesFun).
+
+handle_changes(Req, #db{name=DbName}=Db, ChangesArgs, ChangesFun) ->
     AuthDbName = ?l2b(config:get("couch_httpd_auth", "authentication_db")),
     case AuthDbName of
     DbName ->
@@ -72,9 +77,6 @@ handle_changes_req1(Req, #db{name=DbName}=Db) ->
         % on other databases, _changes is free for all.
         ok
     end,
-    handle_changes_req2(Req, Db).
-
-handle_changes_req2(Req, Db) ->
     MakeCallback = fun(Resp) ->
         fun({change, {ChangeProp}=Change, _}, "eventsource") ->
             Seq = proplists:get_value(<<"seq">>, ChangeProp),
@@ -105,12 +107,12 @@ handle_changes_req2(Req, Db) ->
                 io_lib:format("\n],\n\"last_seq\":~w}\n", [EndSeq])
             ),
             end_json_response(Resp);
+        (timeout, "eventsource") ->
+            send_chunk(Resp, "event: heartbeat\ndata: \n\n");
         (timeout, _) ->
             send_chunk(Resp, "\n")
         end
     end,
-    ChangesArgs = parse_changes_query(Req, Db),
-    ChangesFun = couch_changes:handle_changes(ChangesArgs, Req, Db),
     WrapperFun = case ChangesArgs#changes_args.feed of
     "normal" ->
         {ok, Info} = couch_db:get_db_info(Db),
@@ -631,7 +633,7 @@ send_doc_efficiently(#httpd{mochi_req = MochiReq} = Req,
                     [attachments, follows, att_encoding_info | Options])),
             {ContentType, Len} = couch_doc:len_doc_to_multi_part_stream(
                     Boundary,JsonBytes, Atts, true),
-            CType = {<<"Content-Type">>, ContentType},
+            CType = {"Content-Type", ?b2l(ContentType)},
             {ok, Resp} = start_response_length(Req, 200, [CType|Headers], Len),
             couch_doc:doc_to_multi_part_stream(Boundary,JsonBytes,Atts,
                     fun(Data) -> couch_httpd:send(Resp, Data) end, true)
@@ -677,7 +679,7 @@ send_ranges_multipart(Req, ContentType, Len, Att, Ranges) ->
     {ok, Resp} = start_chunked_response(Req, 206, [CType]),
     couch_httpd:send_chunk(Resp, <<"--", Boundary/binary>>),
     lists:foreach(fun({From, To}) ->
-        ContentRange = make_content_range(From, To, Len),
+        ContentRange = ?l2b(make_content_range(From, To, Len)),
         couch_httpd:send_chunk(Resp,
             <<"\r\nContent-Type: ", ContentType/binary, "\r\n",
             "Content-Range: ", ContentRange/binary, "\r\n",
@@ -701,7 +703,7 @@ receive_request_data(_Req, _) ->
     throw(<<"expected more data">>).
 
 make_content_range(From, To, Len) ->
-    ?l2b(io_lib:format("bytes ~B-~B/~B", [From, To, Len])).
+    io_lib:format("bytes ~B-~B/~B", [From, To, Len]).
 
 update_doc_result_to_json({{Id, Rev}, Error}) ->
         {_Code, Err, Msg} = couch_httpd:error_info(Error),
@@ -898,7 +900,7 @@ db_attachment_req(#httpd{method='GET',mochi_req=MochiReq}=Req, Db, DocId, FileNa
                     Ranges = parse_ranges(MochiReq:get(range), Len),
                     case {Enc, Ranges} of
                         {identity, [{From, To}]} ->
-                            Headers1 = [{<<"Content-Range">>, make_content_range(From, To, Len)}]
+                            Headers1 = [{"Content-Range", make_content_range(From, To, Len)}]
                                 ++ Headers,
                             {ok, Resp} = start_response_length(Req, 206, Headers1, To - From + 1),
                             couch_doc:range_att_foldl(Att, From, To + 1,
@@ -1116,43 +1118,6 @@ parse_doc_query(Req) ->
             Args
         end
     end, #doc_query_args{}, couch_httpd:qs(Req)).
-
-parse_changes_query(Req, Db) ->
-    lists:foldl(fun({Key, Value}, Args) ->
-        case {string:to_lower(Key), Value} of
-        {"feed", _} ->
-            Args#changes_args{feed=Value};
-        {"descending", "true"} ->
-            Args#changes_args{dir=rev};
-        {"since", "now"} ->
-            UpdateSeq = couch_util:with_db(Db#db.name, fun(WDb) ->
-                                        couch_db:get_update_seq(WDb)
-                                end),
-            Args#changes_args{since=UpdateSeq};
-        {"since", _} ->
-            Args#changes_args{since=list_to_integer(Value)};
-        {"last-event-id", _} ->
-            Args#changes_args{since=list_to_integer(Value)};
-        {"limit", _} ->
-            Args#changes_args{limit=list_to_integer(Value)};
-        {"style", _} ->
-            Args#changes_args{style=list_to_existing_atom(Value)};
-        {"heartbeat", "true"} ->
-            Args#changes_args{heartbeat=true};
-        {"heartbeat", _} ->
-            Args#changes_args{heartbeat=list_to_integer(Value)};
-        {"timeout", _} ->
-            Args#changes_args{timeout=list_to_integer(Value)};
-        {"include_docs", "true"} ->
-            Args#changes_args{include_docs=true};
-        {"conflicts", "true"} ->
-            Args#changes_args{conflicts=true};
-        {"filter", _} ->
-            Args#changes_args{filter=Value};
-        _Else -> % unknown key value pair, ignore.
-            Args
-        end
-    end, #changes_args{}, couch_httpd:qs(Req)).
 
 extract_header_rev(Req, ExplicitRev) when is_binary(ExplicitRev) or is_list(ExplicitRev)->
     extract_header_rev(Req, couch_doc:parse_rev(ExplicitRev));
