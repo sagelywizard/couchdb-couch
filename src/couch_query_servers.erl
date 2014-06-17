@@ -84,18 +84,6 @@ map_doc_raw(Proc, Doc) ->
     {ok, proc_prompt_raw(Proc, [<<"map_doc">>, Json])}.
 
 
-map_docs_raw(Proc, DocList) ->
-    couch_log:error("DocList: ~p", [DocList]),
-    {Mod, Fun} = Proc#proc.prompt_many_fun,
-    CommandList = lists:map(
-        fun(Doc) ->
-            EJson = couch_doc:to_json_obj(Doc, []),
-            [<<"map_doc">>, EJson]
-        end,
-        DocList),
-    Mod:Fun(Proc#proc.pid, CommandList).
-
-
 stop_doc_map(nil) ->
     ok;
 stop_doc_map(Proc) ->
