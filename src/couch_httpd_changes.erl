@@ -327,8 +327,6 @@ parse_changes_query(Req, Db, IsViewChanges) ->
             Args#changes_args{conflicts=true};
         {"filter", _} ->
             Args#changes_args{filter=Value};
-        {"include_values", "true"} when IsViewChanges ->
-            Args#changes_args{include_values=Value};
         _Else -> % unknown key value pair, ignore.
             Args
         end

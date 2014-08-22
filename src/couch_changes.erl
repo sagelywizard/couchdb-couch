@@ -63,19 +63,20 @@ handle_changes(Args1, Req, Db0, Type) ->
             SNFun = fun() ->
                 Self = self(),
                 DbName1 = Db0#db.name,
-                couch_index_event:start_link(
+                couch_mrview_update_notifier:start_link(
                     fun(Msg) ->
                         case Msg of
-                            {index_update, {DbName1, DDocId, couch_mrview_index}} ->
+                            {index_update, DbName1, DDocId} ->
                                 Self ! updated;
-                            {index_delete, {DbName1, DDocId, couch_mrview_index}} ->
+                            {index_delete, DbName1, DDocId} ->
                                 Self ! deleted;
-                            _ ->
+                            Other ->
+                                ?LOG_ERROR("Other thing: ~p ~p ~p", [DbName1, DDocId, Other]),
                                 ok
                         end
                     end)
             end,
-            {ok, {_, View0, _}, _, _} = couch_mrview_util:get_view(Db0#db.name, <<"_design/", DDocId/binary>>, ViewName, #mrargs{}),
+            {ok, {_, View0, _}, _, _} = couch_mrview_util:get_view(Db0#db.name, DDocId, ViewName, #mrargs{}),
             {SNFun, View0};
         db ->
             SNFun = fun() ->
@@ -140,7 +141,7 @@ handle_changes(Args1, Req, Db0, Type) ->
             Acc0 = build_acc(Args#changes_args{feed="normal"}, Callback,
                              UserAcc2, Db, StartSeq, <<>>, Timeout, TimeoutFun, View),
             {ok, #changes_acc{seq = LastSeq, user_acc = UserAcc3}} =
-                initial_fold(
+                send_changes(
                     Acc0,
                     Dir,
                     true),
@@ -363,7 +364,7 @@ build_acc(Args, Callback, UserAcc, Db, StartSeq, Prepend, Timeout, TimeoutFun, V
         view = View
     }.
 
-initial_fold(Acc, Dir, FirstRound) ->
+send_changes(Acc, Dir, FirstRound) ->
     #changes_acc{
         db = Db,
         seq = StartSeq,
@@ -453,7 +454,7 @@ keep_sending_changes(Args, Acc0, FirstRound) ->
         db_open_options = DbOptions
     } = Args,
 
-    {ok, ChangesAcc} = initial_fold(Acc0, fwd, FirstRound),
+    {ok, ChangesAcc} = send_changes(Acc0, fwd, FirstRound),
 
     #changes_acc{
         db = Db, callback = Callback,
@@ -504,7 +505,7 @@ changes_enumerator(Value, #changes_acc{resp_type = ResponseType} = Acc)
         undefined ->
             {Value#doc_info.high_seq, filter(Db, Value, Filter)};
         #mrview{} ->
-            {Seq0, _} = Value,
+            {{Seq0, _}, _} = Value,
             {Seq0, [ok]} % TODO
     end,
     Results = [Result || Result <- Results0, Result /= null],
@@ -535,7 +536,7 @@ changes_enumerator(Value, Acc) ->
         undefined ->
             {Value#doc_info.high_seq, filter(Db, Value, Filter)};
         #mrview{} ->
-            {Seq0, _} = Value,
+            {{Seq0,_}, _} = Value,
             {Seq0, [ok]} % TODO view filter
     end,
     Results = [Result || Result <- Results0, Result /= null],
