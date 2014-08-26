@@ -71,7 +71,7 @@ handle_changes(Args1, Req, Db0, Type) ->
         _ ->
             false
     end,
-    {StartNotifierFun, DDocName, ViewName, View} = if UseViewChanges ->
+    {StartNotifierFun, DDocName, ViewName} = if UseViewChanges ->
         {DDocName0, ViewName0} = case {Type, Filter} of
             {{view, DDocName1, ViewName1}, _} ->
                 {DDocName1, ViewName1};
@@ -101,7 +101,7 @@ handle_changes(Args1, Req, Db0, Type) ->
             _ ->
                 throw({bad_request, "view changes not enabled"})
         end,
-        {SNFun, DDocName0, ViewName0, View0};
+        {SNFun, DDocName0, ViewName0};
      true ->
         SNFun = fun() ->
             Self = self(),
@@ -113,7 +113,7 @@ handle_changes(Args1, Req, Db0, Type) ->
                 end
             )
         end,
-        {SNFun, undefined, undefined, undefined}
+        {SNFun, undefined, undefined}
     end,
     Start = fun() ->
         {ok, Db} = couch_db:reopen(Db0),
@@ -123,7 +123,14 @@ handle_changes(Args1, Req, Db0, Type) ->
         fwd ->
             Since
         end,
-        {Db, StartSeq}
+        View2 = if UseViewChanges ->
+            {ok, {_, View1, _}, _, _} = couch_mrview_util:get_view(
+                    Db0#db.name, DDocName, ViewName, #mrargs{}),
+            View1;
+        true ->
+            undefined
+        end,
+        {Db, View2, StartSeq}
     end,
     % begin timer to deal with heartbeat when filter function fails
     case Args#changes_args.heartbeat of
@@ -139,7 +146,7 @@ handle_changes(Args1, Req, Db0, Type) ->
             {Callback, UserAcc} = get_callback_acc(CallbackAcc),
             {ok, Notify} = StartNotifierFun(),
 
-            {Db, StartSeq} = Start(),
+            {Db, View, StartSeq} = Start(),
             UserAcc2 = start_sending_changes(Callback, UserAcc, Feed),
             {Timeout, TimeoutFun} = get_changes_timeout(Args, Callback),
             Acc0 = build_acc(Args, Callback, UserAcc2, Db, StartSeq,
@@ -160,7 +167,7 @@ handle_changes(Args1, Req, Db0, Type) ->
             {Callback, UserAcc} = get_callback_acc(CallbackAcc),
             UserAcc2 = start_sending_changes(Callback, UserAcc, Feed),
             {Timeout, TimeoutFun} = get_changes_timeout(Args, Callback),
-            {Db, StartSeq} = Start(),
+            {Db, View, StartSeq} = Start(),
             Acc0 = build_acc(Args#changes_args{feed="normal"}, Callback,
                              UserAcc2, Db, StartSeq, <<>>, Timeout, TimeoutFun,
                              DDocName, ViewName, View),
